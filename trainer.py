@@ -12,8 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
 from typing import Any, Union
-from utils.models.metrics import METRICS
-from utils.models.tracker import ModuleTracker
+from metrics import METRICS
+from tracker import ModuleTracker
 
 
 def save_json(data, path: str):
