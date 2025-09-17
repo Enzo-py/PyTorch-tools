@@ -11,6 +11,7 @@ class ModuleTracker:
         import os
         import sys
         import torch
+        import math
 
         import torch.nn.functional as F
 
@@ -26,6 +27,8 @@ class ModuleTracker:
         Décorateur à appliquer sur une classe nn.Module
         pour capturer récursivement les classes utilisées.
         """
+
+        if not issubclass(model_cls, nn.Module): raise TypeError(f"The class <{model_cls}> doesn't inherit from nn.Module")
         original_init = model_cls.__init__
 
         def __init__(self, *args, **kwargs):
