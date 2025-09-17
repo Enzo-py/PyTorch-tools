@@ -1,19 +1,22 @@
+import asyncio
 import os
 import importlib.util
 import sys
 import json
+import time
 import torch
 
 import torch.optim as optim
 import matplotlib.pyplot as plt
 import torch.optim.lr_scheduler as lr_sched
 
+from itertools import islice
 from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
 from typing import Any, Union
-from metrics import METRICS
-from tracker import ModuleTracker
+from utils.models.metrics import METRICS
+from utils.models.tracker import ModuleTracker
 
 
 def save_json(data, path: str):
@@ -27,6 +30,83 @@ def save_json(data, path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(data, f, indent=4)
+
+import asyncio
+import threading
+import inspect
+
+import asyncio
+import threading
+import inspect
+import time
+
+# ----------------------------------------------------------------------
+class AsyncContext:
+    """Objet passé à la callback pour créer des tâches et garantir qu’on les attend."""
+    def __init__(self):
+        self._tasks = []
+
+    def create_task(self, coro):
+        t = asyncio.create_task(coro)   # tâche planifiée sur la loop courante
+        self._tasks.append(t)
+        return t
+
+    async def wait_all(self):
+        """Attend toutes les tâches créées via create_task()."""
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=False)
+            self._tasks.clear()
+
+# ----------------------------------------------------------------------
+class AsyncCallbackRunner:
+    def __init__(self):
+        self._init_loop()
+
+    # ---- event-loop dans un thread dédié ----------------------------------
+    def _init_loop(self):
+        self.loop   = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._entry, daemon=True)
+        self.thread.start()
+
+    def _entry(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    # ---- exécution BLOQUANTE d’un callback (sync ou async) ----------------
+    def run_blocking(self, callback, *args, **kwargs):
+        if callback is None:
+            return
+
+        # Cas callback synchrone : on exécute simplement
+        if not inspect.iscoroutinefunction(callback):
+            return callback(*args, **kwargs)
+
+        # Si la loop a été fermée (ou thread mort) on la recrée
+        if not self.thread.is_alive() or self.loop.is_closed():
+            self.shutdown()
+            self._init_loop()
+
+        async def _wrapped():
+            ctx = AsyncContext()                   # contexte pour cette exécution
+            res = await callback(*args, ctx=ctx, **kwargs)
+            await ctx.wait_all()                   # attendre toutes les sous-tâches
+            await asyncio.sleep(0)                 # micro-yield
+            return res
+
+        fut = asyncio.run_coroutine_threadsafe(_wrapped(), self.loop)
+
+        # Attente “coopérative” → la loop continue de tourner, Ctrl+C reste actif
+        while not fut.done():
+            time.sleep(0.01)
+
+        return fut.result()                        # propage exceptions au besoin
+
+    # ---- arrêt propre ------------------------------------------------------
+    def shutdown(self):
+        if hasattr(self, "loop") and self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        if hasattr(self, "thread"):
+            self.thread.join()
 
 class Trainer:
     """
@@ -92,17 +172,21 @@ class Trainer:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             model_name = model_cls.__name__
             self.run_name = f"{model_name}_{timestamp}"
+
+        self.loading = loading
+        self.loaded = False
         
         self.save_dir = Path(base_dir) / self.run_name
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
-        loss_module = getattr(loss_cls, '__module__', '')
-        if loss_module.startswith('torch'): self.config['loss_module'] = loss_module
-        elif loss_module.startswith('builtins'): self.config['loss_module'] = loss_module[len('builtins'):]
-        else: self._save_module_code(self.loss, "loss.py")
+        if not loading:
+            loss_module = getattr(loss_cls, '__module__', '')
+            if loss_module.startswith('torch'): self.config['loss_module'] = loss_module
+            elif loss_module.startswith('builtins'): self.config['loss_module'] = loss_module[len('builtins'):]
+            else: self._save_module_code(self.loss, "loss.py")
 
-        self._save_module_code(self.model, "model.py")
-        save_json(self.config, self.save_dir / 'config.json')
+            self._save_module_code(self.model, "model.py")
+            save_json(self.config, self.save_dir / 'config.json')
 
         self.start_epoch = 0
         self.best_metric = None
@@ -145,6 +229,7 @@ class Trainer:
             self.logs = ckpt["logs"]
             self.start_epoch = ckpt["epoch"]
             print(f"✅ Resuming from epoch {self.start_epoch}")
+            self.loaded = True
         else:
             self.start_epoch = 0
     
@@ -155,7 +240,7 @@ class Trainer:
             self.logs["metrics"][k]["train"].append(train_metrics[k])
             self.logs["metrics"][k]["test"].append(test_metrics[k])
 
-    def _step(self, loader, device, train=False):
+    def _step(self, loader, device, epoch, train=False):
         self.model.train() if train else self.model.eval()
 
         total_loss = 0.0
@@ -164,14 +249,16 @@ class Trainer:
 
         with torch.set_grad_enabled(train):
             for batch in loader:
-                inputs = batch.to(device)
+
+                if isinstance(batch, (list, tuple)): inputs = list(map(lambda b: b.to(device) if isinstance(b, torch.Tensor) else b, batch))
+                else: inputs = batch.to(device)
 
                 outputs = self.model(inputs)
                 others_outs = {}
                 if isinstance(outputs, tuple): # differents values returned: (prediction, others_outs:dict)
                     outputs, others_outs = outputs
 
-                loss = self.loss(outputs, inputs, others_outs)
+                loss = self.loss(outputs, inputs, others_outs, epoch, device=device)
                 sub_losses = {}
                 if isinstance(loss, tuple): # differents values returned: (total loss, sub_losses:dict)
                     loss, sub_losses = loss
@@ -193,15 +280,17 @@ class Trainer:
         return avg_loss, avg_metrics
 
     def _run_epoch(self, epoch, train_loader, test_loader, device, verbose):
-        train_loss, train_metrics = self._step(train_loader, device, train=True)
-        test_loss, test_metrics = self._step(test_loader, device, train=False)
+        train_loss, train_metrics = self._step(train_loader, device, epoch, train=True)
+        test_loss, test_metrics = self._step(test_loader, device, epoch, train=False)
 
         self._log_epoch(train_loss, test_loss, train_metrics, test_metrics)
 
-        main_metric = list(test_metrics.keys())[0] # TODO: unfix
-        if self.best_metric is None or main_metric > self.best_metric:
-            self.best_metric = main_metric
-            self._save_best_sample(test_loader, device)
+
+        if len(test_metrics.keys()):
+            main_metric = list(test_metrics.keys())[0] # TODO: unfix
+            if self.best_metric is None or main_metric > self.best_metric:
+                self.best_metric = main_metric
+                self._save_best_sample(test_loader, device)
 
         self._save_checkpoint(epoch + 1)
 
@@ -237,7 +326,7 @@ class Trainer:
                 return f"{v:,.6f}".replace(",", " ")
 
         # Largeur dynamique
-        name_w = max(12, *(len(k) for k in self.metrics))
+        name_w = max(12, *(len(k) for k in self.metrics)) if len(self.metrics) else 3
         V = [fmt(train_loss), fmt(test_loss)]
         for k in self.metrics:
             V += [fmt(train_metrics[k]), fmt(test_metrics[k])]
@@ -277,14 +366,22 @@ class Trainer:
     def _save_best_sample(self, test_loader, device):
         self.model.eval()
         with torch.no_grad():
-            inputs = next(iter(test_loader)).to(device)
+            batch = next(iter(test_loader))
+            if isinstance(batch, (list, tuple)): inputs = list(map(lambda b: b.to(device) if isinstance(b, torch.Tensor) else b, batch))
+            else: inputs = batch.to(device)
             outputs = self.model(inputs)
             if isinstance(outputs, tuple): # differents values returned: (prediction, *others)
                 outputs, _ = outputs
 
+        if isinstance(inputs, (list, tuple)): inputs = list(map(lambda b: b.detach().cpu() if isinstance(b, torch.Tensor) else b, inputs))
+        else: inputs = inputs.detach().cpu()
+
+        if isinstance(outputs, (list, tuple)): outputs = list(map(lambda b: b.detach().cpu() if isinstance(b, torch.Tensor) else b, outputs))
+        else: outputs = outputs.detach().cpu()
+        
         torch.save({
-            "inputs": inputs.detach().cpu(),
-            "outputs": outputs.detach().cpu()
+            "inputs": inputs,
+            "outputs": outputs
         }, self.save_dir / "best_sample.pt")
 
     def _save_all(self):
@@ -315,7 +412,7 @@ class Trainer:
         print("✅ Training complete.")
 
     @torch.no_grad()
-    def get(self, loader, device, others_keys=None):
+    def get(self, loader, device, idx=0, others_keys=None):
         """
         Retourne un tuple (inputs, outputs, ~others) depuis le train ou test set.
 
@@ -328,16 +425,137 @@ class Trainer:
             inputs, outputs (tensors sur CPU)
             others: dict if others_keys is not None (not detach)
         """
+        if self.loading and not self.loaded: self._resume_from_checkpoint(device)
         self.model.eval()
-        inputs = next(iter(loader)).to(device)
+
+        batch = next(iter(loader)) if idx == 0 else next(islice(iter(loader), idx))
+        if isinstance(batch, (list, tuple)): inputs = list(map(lambda b: b.to(device) if isinstance(b, torch.Tensor) else b, batch))
+        else: inputs = batch.to(device)
+
         outputs = self.model(inputs)
         others = {}
         if isinstance(outputs, tuple): # differents values returned: (prediction, *others)
             outputs, others = outputs
         
+        if isinstance(inputs, (list, tuple)): inputs = list(map(lambda b: b.detach().cpu() if isinstance(b, torch.Tensor) else b, inputs))
+        else: inputs = inputs.detach().cpu()
+
+        if isinstance(outputs, (list, tuple)): outputs = list(map(lambda b: b.detach().cpu() if isinstance(b, torch.Tensor) else b, outputs))
+        else: outputs = outputs.detach().cpu()
+
         if others_keys is not None:
-            return inputs.detach().cpu(), outputs.detach().cpu(), {k: others.get(k) for k in others_keys}
-        return inputs.detach().cpu(), outputs.detach().cpu()
+            return inputs, outputs, {k: others.get(k) for k in others_keys}
+        return inputs, outputs
+
+    @torch.no_grad()
+    def get_all(self, loader, device, others_keys=None, on_batch_end=None):
+        """
+        Retourne l'ensemble des (inputs, outputs, ~others) pour un DataLoader.
+
+        Paramètres :
+            loader : torch.utils.data.DataLoader
+            device : torch.device
+            others_keys : liste de clés à extraire dans le dictionnaire retourné par le modèle
+
+        Retour :
+            all_inputs : liste de batches (tensor CPU)
+            all_outputs : liste de batches (tensors CPU)
+            all_others : liste de dictionnaires (si others_keys est spécifié)
+        """
+        if self.loading and not self.loaded: self._resume_from_checkpoint(device)
+        self.model.eval()
+
+        for name, module in self.model.named_modules():
+            if hasattr(module, "training"):
+                if module.training: raise Exception()
+        
+        all_inputs = []
+        all_outputs = []
+        all_others = []
+
+        idx = 0
+        for batch in loader:
+            if isinstance(batch, (list, tuple)):
+                inputs = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+            else:
+                inputs = batch.to(device)
+
+            outputs = self.model(inputs)
+            others = {}
+            if isinstance(outputs, tuple):
+                outputs, others = outputs
+
+            all_inputs.append(batch)
+
+            if isinstance(outputs, (list, tuple)): outputs = list(map(lambda b: b.detach().cpu() if isinstance(b, torch.Tensor) else b, outputs))
+            else: outputs = outputs.detach().cpu()
+
+            all_outputs.append(outputs)
+
+            if others_keys is not None:
+                extracted = {k: others.get(k) for k in others_keys}
+                all_others.append(extracted)
+
+            if on_batch_end:
+                on_batch_end(batch_idx=idx, nb_batch=len(loader))
+            idx += 1
+
+        if others_keys is not None:
+            return all_inputs, all_outputs, all_others
+        return all_inputs, all_outputs
+        
+    async def async_get_all(self, loader, device, others_keys=None, on_batch_end=None):
+        if self.loading and not self.loaded:
+            self._resume_from_checkpoint(device)
+
+        self.model.eval()
+        loop = asyncio.get_running_loop()
+        torch.set_num_threads(1)                    # global (process-wide)
+
+        all_inputs, all_outputs, all_others = [], [], []
+        nb = len(loader)
+
+        for idx, batch in enumerate(loader):
+            # ---- 1) Copier sur device une seule fois ---------------------------
+            if isinstance(batch, (list, tuple)):
+                inputs = [b.to(device, non_blocking=True) if torch.is_tensor(b) else b
+                        for b in batch]
+            else:
+                inputs = batch.to(device, non_blocking=True)
+
+            # ---- 2) Inférence hors event-loop (+ no_grad + threads limités) ----
+            def _forward():
+                torch.set_num_threads(1)            # sûr pour chaque thread
+                with torch.no_grad():
+                    out = self.model(inputs) if isinstance(inputs, (list, tuple)) else self.model(inputs)
+                return out
+
+            outputs = await loop.run_in_executor(None, _forward)
+
+            # ---- 3) Déballage / détachage CPU ----------------------------------
+            if isinstance(outputs, tuple):
+                outputs, others = outputs
+            else:
+                others = {}
+
+            if isinstance(outputs, (list, tuple)):
+                outputs = [t.detach().cpu() if torch.is_tensor(t) else t for t in outputs]
+            else:
+                outputs = outputs.detach().cpu()
+
+            all_inputs.append([t.cpu() if torch.is_tensor(t) else t for t in inputs])
+            all_outputs.append(outputs)
+
+            if others_keys is not None:
+                all_others.append({k: others.get(k) for k in others_keys})
+
+            # ---- 4) Callback batch async + micro-yield --------------------------
+            if on_batch_end:
+                await on_batch_end(batch_idx=idx, nb_batch=nb)
+            await asyncio.sleep(0)                  # laisse l’event-loop respirer
+
+        return (all_inputs, all_outputs, all_others) if others_keys is not None else (all_inputs, all_outputs)
+
 
 
     def plot(self, *keys, title=None):
